@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio Player</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0a0a0a; display:flex; justify-content:center; align-items:center; min-height:100vh; font-family:system-ui, -apple-system, sans-serif; }
+  .player { background:#1a1a1a; padding:24px; border-radius:12px; color:#fff; width:90%; max-width:400px; text-align:center; }
+  h3 { margin-bottom:16px; font-size:20px; }
+  audio { width:100%; margin:16px 0; outline:none; }
+  .download-btn { display:inline-block; background:#ff3b30; color:#fff; padding:10px 24px; border:none; border-radius:8px; cursor:pointer; font-size:16px; text-decoration:none; margin-top:8px; }
+  .download-btn:hover { background:#e0352b; }
+</style>
+</head>
+<body>
+<div class="player">
+  <h3>🎵 Audio</h3>
+  <audio controls src="__AUDIO_URL__">
+    Your browser does not support the audio element.
+  </audio>
+  <a class="download-btn" href="__ZIP_URL__" download>⬇ Download ZIP</a>
+</div>
+</body>
+</html>
