@@ -9,8 +9,10 @@
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:#0a0a0a; display:flex; justify-content:center; align-items:center; min-height:100vh; font-family:system-ui, -apple-system, sans-serif; }
   .player-container { width:100%; max-width:960px; position:relative; background:#000; border-radius:8px; overflow:hidden; box-shadow:0 8px 32px rgba(0,0,0,0.5); }
-  video { width:100%; display:block; background:#000; }
-  .controls { position:absolute; bottom:0; left:0; right:0; background:linear-gradient(transparent, rgba(0,0,0,0.8)); padding:40px 16px 16px; transition:opacity 0.3s; }
+  /* Fullscreen: container takes full viewport */
+  .player-container:fullscreen { max-width: 100%; border-radius: 0; }
+  video { width:100%; height:auto; display:block; background:#000; object-fit: contain; }
+  .controls { position:absolute; bottom:0; left:0; right:0; background:linear-gradient(transparent, rgba(0,0,0,0.8)); padding:40px 16px 16px; opacity:1; transition:opacity 0.4s ease; }
   .controls.hidden { opacity:0; pointer-events:none; }
   .progress-bar { width:100%; height:6px; background:rgba(255,255,255,0.2); border-radius:3px; cursor:pointer; margin-bottom:12px; position:relative; }
   .progress-fill { height:100%; background:#ff3b30; border-radius:3px; width:0%; transition:width 0.1s linear; }
@@ -33,7 +35,7 @@
 </style>
 </head>
 <body>
-<div class="player-container">
+<div class="player-container" id="playerContainer">
   <video id="video" crossorigin="anonymous" playsinline></video>
   <div class="spinner" id="spinner"></div>
   <div class="overlay" id="playOverlay" onclick="playVideo()">
@@ -73,9 +75,28 @@ const progressFill = document.getElementById('progressFill');
 const progressThumb = document.getElementById('progressThumb');
 const timeDisplay = document.getElementById('timeDisplay');
 const spinner = document.getElementById('spinner');
+const container = document.getElementById('playerContainer');
 
 let hls;
 const PLAYLIST_URL = '__PLAYLIST_URL__';
+let idleTimer;
+
+// Idle auto-hide controls
+function resetIdleTimer() {
+  controls.classList.remove('hidden');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (!video.paused) {
+      controls.classList.add('hidden');
+    }
+  }, 3000);
+}
+
+container.addEventListener('mousemove', resetIdleTimer);
+container.addEventListener('touchstart', resetIdleTimer);
+container.addEventListener('touchmove', resetIdleTimer);
+video.addEventListener('play', resetIdleTimer);
+video.addEventListener('pause', () => controls.classList.remove('hidden'));
 
 video.addEventListener('waiting', function() { spinner.style.display = 'block'; });
 video.addEventListener('canplay', function() { spinner.style.display = 'none'; });
@@ -87,7 +108,6 @@ function initPlayer() {
     hls = new Hls({ debug: false });
     hls.loadSource(PLAYLIST_URL);
     hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, function() {});
     hls.on(Hls.Events.ERROR, function(event, data) {
       if (data.fatal) alert('Playback error. Please try again later.');
     });
@@ -167,7 +187,7 @@ function muteToggle() { video.muted = !video.muted; }
 function setSpeed(speed) { video.playbackRate = parseFloat(speed); }
 function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
-  else video.parentElement.requestFullscreen();
+  else container.requestFullscreen();
 }
 function formatTime(s) {
   if (isNaN(s)) return '0:00';
