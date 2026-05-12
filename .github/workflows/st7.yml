@@ -1,4 +1,4 @@
-name: 🎬 YouTube HLS Streamer v3
+name: 🎬 YouTube HLS Streamer v4
 
 on:
   workflow_dispatch:
@@ -20,15 +20,10 @@ on:
         required: false
         type: string
         default: '720p'
-      split_threshold_mb:
-        description: '📦 Split files larger than (MB) — 0 = never'
-        required: false
-        type: number
-        default: 90
 
 jobs:
   stream:
-    name: 🎬 HLS Stream & ZIP
+    name: 🎬 HLS Stream & Download
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -36,6 +31,7 @@ jobs:
     env:
       BRANCH_NAME_STREAM: stream-${{ github.run_id }}
       BRANCH_NAME_DOWNLOAD: download-${{ github.run_id }}
+      CONFIG_BASE: https://raw.githubusercontent.com/${{ github.repository_owner }}/yt-streamer-config/refs/heads/main
     steps:
       # ---------- setup ----------
       - name: 📂 Checkout Repository
@@ -44,6 +40,18 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
           fetch-depth: 1
+
+      - name: 📥 Fetch shared scripts & templates
+        run: |
+          echo "📥 Downloading shared files from yt-streamer-config..."
+          curl -sSL -o converter.py            "$CONFIG_BASE/converter.py"
+          curl -sSL -o sanitize.py             "$CONFIG_BASE/sanitize.py"
+          curl -sSL -o segment.sh              "$CONFIG_BASE/segment.sh"
+          curl -sSL -o player-template.html    "$CONFIG_BASE/player-template.html"
+          curl -sSL -o audio-player-template.html "$CONFIG_BASE/audio-player-template.html"
+          curl -sSL -o download.html           "$CONFIG_BASE/download.html"
+          chmod +x segment.sh
+          echo "✅ All files fetched"
 
       - name: 📦 Cache static ffmpeg
         id: cache-ffmpeg
@@ -395,18 +403,68 @@ jobs:
           done
           echo "✅ Playlist rewritten"
 
+      # ---------- prepare download delivery ----------
+      - name: 📦 Prepare Download Delivery
+        id: download
+        run: |
+          set -euo pipefail
+          FILENAME=$(sed -n '2p' /tmp/metadata.txt)
+          INPUT_FILE="./downloads/temp/$FILENAME"
+          OUTPUT_TYPE=$(sed -n '3p' /tmp/metadata.txt)
+          REPO="${{ github.repository }}"
+          DOWNLOAD_DIR="./download-staging"
+          mkdir -p "$DOWNLOAD_DIR"
+
+          SIZE=$(stat -c%s "$INPUT_FILE")
+          SIZE_MB=$((SIZE / 1048576))
+
+          if [[ "$SIZE_MB" -le 90 ]]; then
+            echo "📁 File ≤ 90 MB – pushing raw file directly"
+            cp "$INPUT_FILE" "$DOWNLOAD_DIR/$FILENAME"
+            DOWNLOAD_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_DOWNLOAD}/${FILENAME}"
+            echo "download_url=${DOWNLOAD_URL}" >> $GITHUB_OUTPUT
+          else
+            echo "📁 File > 90 MB – segmenting into playable parts"
+            INPUT_FILE="$INPUT_FILE" DOWNLOAD_DIR="$DOWNLOAD_DIR" bash segment.sh
+            PARTS=$(ls -1 "$DOWNLOAD_DIR"/part_*.mp4 | sort)
+
+            # Build JSON array for download.html
+            JSON_PARTS="["
+            FIRST=true
+            TOTAL_SIZE=0
+            for f in $PARTS; do
+              BASENAME=$(basename "$f")
+              SIZE_B=$(stat -c%s "$f")
+              TOTAL_SIZE=$((TOTAL_SIZE + SIZE_B))
+              URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_DOWNLOAD}/${BASENAME}"
+              if [ "$FIRST" = true ]; then FIRST=false; else JSON_PARTS+=","; fi
+              JSON_PARTS+="{\"name\":\"${BASENAME}\",\"url\":\"${URL}\",\"size\":${SIZE_B}}"
+            done
+            JSON_PARTS+="]"
+
+            # Replace placeholders in download.html
+            sed -e "s|__PARTS__|${JSON_PARTS}|g" \
+                -e "s|__FILENAME__|${FILENAME}|g" \
+                -e "s|__TOTAL_SIZE__|${TOTAL_SIZE}|g" \
+                -e "s|__SHA256__||g" \
+                download.html > "$DOWNLOAD_DIR/download.html"
+
+            DOWNLOAD_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_DOWNLOAD}/download.html"
+            echo "download_url=${DOWNLOAD_URL}" >> $GITHUB_OUTPUT
+          fi
+
       # ---------- player HTML generation ----------
       - name: 🎨 Generate Video Player HTML
         if: ${{ github.event.inputs.type == 'video' }}
         run: |
           if [ ! -f hls.min.js ]; then
             echo "📥 Downloading hls.min.js from CDN..."
-            curl -sS -L -o hls.min.js https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js
+            curl -sSL -o hls.min.js https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js
           fi
 
           REPO="${{ github.repository }}"
           BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_STREAM}"
-          ZIP_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH_NAME_DOWNLOAD}.zip"
+          DOWNLOAD_URL="${{ steps.download.outputs.download_url }}"
 
           PLAYLIST_URL="${BASE_URL}/master.m3u8"
           if [[ "${{ steps.process_video.outputs.has_subtitles }}" != "true" ]]; then
@@ -416,7 +474,7 @@ jobs:
           ORIGINAL_FILENAME=$(sed -n '2p' /tmp/metadata.txt)
 
           sed -e "s|__PLAYLIST_URL__|${PLAYLIST_URL}|g" \
-              -e "s|__ZIP_URL__|${ZIP_URL}|g" \
+              -e "s|__ZIP_URL__|${DOWNLOAD_URL}|g" \
               -e "s|__VIDEO_TITLE__|${ORIGINAL_FILENAME}|g" \
               player-template.html > /tmp/player.html
 
@@ -429,86 +487,34 @@ jobs:
           "
           cp /tmp/player.html ./player.html
 
+          # ---- Write metadata for the bot ----
+          jq -n --arg url "$DOWNLOAD_URL" '{"download_url":$url}' > metadata.json
+
       - name: 🎨 Generate Audio Player HTML
         if: ${{ github.event.inputs.type == 'audio' }}
         run: |
           REPO="${{ github.repository }}"
           BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_STREAM}"
           AUDIO_URL="${BASE_URL}/audio.mp3"
-          ZIP_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH_NAME_DOWNLOAD}.zip"
+          DOWNLOAD_URL="${{ steps.download.outputs.download_url }}"
           FILENAME=$(sed -n '2p' /tmp/metadata.txt)
 
           sed -e "s|__AUDIO_URL__|${AUDIO_URL}|g" \
-              -e "s|__ZIP_URL__|${ZIP_URL}|g" \
+              -e "s|__ZIP_URL__|${DOWNLOAD_URL}|g" \
               -e "s|__AUDIO_TITLE__|${FILENAME}|g" \
               audio-player-template.html > /tmp/audio-player.html
           cp /tmp/audio-player.html ./audio-player.html
 
-      # ---------- split & push download branch ----------
-      - name: 📦 Split Original & Push to Download Branch (batched)
+          # ---- Write metadata for the bot ----
+          jq -n --arg url "$DOWNLOAD_URL" '{"download_url":$url}' > metadata.json
+
+      # ---------- push download branch ----------
+      - name: 🚀 Push Download Branch (batched)
+        if: ${{ steps.download.outputs.download_url != '' }}
         run: |
           set -euo pipefail
-          FILENAME=$(sed -n '2p' /tmp/metadata.txt)
-          INPUT_FILE="./downloads/temp/$FILENAME"
-          OUTPUT_TYPE=$(sed -n '3p' /tmp/metadata.txt)
-          THRESHOLD_MB="${{ github.event.inputs.split_threshold_mb }}"
-          HARD_LIMIT_MB=90
-          DOWNLOAD_DIR="./download-zip"
-          mkdir -p "$DOWNLOAD_DIR"
-
-          if [[ ! -f "$INPUT_FILE" ]]; then
-            echo "❌ Original file missing; cannot create download archive"
-            exit 1
-          fi
-
-          echo "📦 Preparing download archive for: $FILENAME"
-
-          if [[ "$THRESHOLD_MB" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            THRESHOLD_MB=$(printf "%.0f" "$THRESHOLD_MB")
-          else
-            echo "❌ Invalid split threshold: $THRESHOLD_MB"
-            exit 1
-          fi
-
-          SIZE=$(stat -c%s "$INPUT_FILE")
-          SIZE_MB=$((SIZE / 1048576))
-
-          SPLIT_SIZE="$THRESHOLD_MB"
-          if [[ $SPLIT_SIZE -eq 0 || $SPLIT_SIZE -gt $HARD_LIMIT_MB ]]; then
-            if [[ $SIZE -gt $((HARD_LIMIT_MB * 1048576)) ]]; then
-              SPLIT_SIZE="$HARD_LIMIT_MB"
-              echo "🛡️ File exceeds hard limit → force-split at ${SPLIT_SIZE} MB"
-            else
-              echo "📁 File size ${SIZE_MB} MB — no split needed"
-              cp "$INPUT_FILE" "$DOWNLOAD_DIR/"
-            fi
-          fi
-
-          if [[ $SPLIT_SIZE -gt 0 && $SIZE -gt $((SPLIT_SIZE * 1048576)) ]]; then
-            echo "✂️ Splitting ${SIZE_MB} MB file into ${SPLIT_SIZE} MB parts..."
-            cd "$DOWNLOAD_DIR"
-            if [[ "$OUTPUT_TYPE" == "audio" ]]; then
-              ZIP_BASE="audio.zip"
-            else
-              ZIP_BASE="video.zip"
-            fi
-            cp "$OLDPWD/$INPUT_FILE" "./$FILENAME"
-            zip -r -s "${SPLIT_SIZE}m" "$ZIP_BASE" "$FILENAME"
-            rm -f "$FILENAME"
-            cd "$OLDPWD"
-            echo "✅ Split completed"
-          elif [[ $SPLIT_SIZE -eq 0 ]]; then
-            cp "$INPUT_FILE" "$DOWNLOAD_DIR/"
-            echo "📁 No split requested — single file copied"
-          elif [[ $SIZE -le $((SPLIT_SIZE * 1048576)) ]]; then
-            cp "$INPUT_FILE" "$DOWNLOAD_DIR/"
-            echo "📁 File under split threshold — single file kept"
-          fi
-
-          echo "📂 Files in download staging:"
-          ls -lh "$DOWNLOAD_DIR"
-
           REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          DOWNLOAD_DIR="./download-staging"
           ORPHAN_DIR=$(mktemp -d)
           cp -a "$DOWNLOAD_DIR"/* "$ORPHAN_DIR/"
 
@@ -568,6 +574,7 @@ jobs:
           cp /tmp/hls/*.m3u8 "$ORPHAN_DIR/" 2>/dev/null || true
           cp /tmp/subtitles.vtt "$ORPHAN_DIR/" 2>/dev/null || true
           cp /tmp/player.html "$ORPHAN_DIR/"
+          cp metadata.json "$ORPHAN_DIR/"
 
           cd "$ORPHAN_DIR"
           git init --initial-branch=main
@@ -621,6 +628,7 @@ jobs:
 
           cp /tmp/audio/audio.mp3 "$ORPHAN_DIR/"
           cp /tmp/audio-player.html "$ORPHAN_DIR/"
+          cp metadata.json "$ORPHAN_DIR/"
 
           cd "$ORPHAN_DIR"
           git init --initial-branch=main
@@ -659,6 +667,6 @@ jobs:
           else
             echo "🎵 Audio page: https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_STREAM}/audio-player.html"
           fi
-          echo "📦 Download ZIP: https://github.com/${REPO}/archive/refs/heads/${BRANCH_NAME_DOWNLOAD}.zip"
+          echo "📦 Download: ${{ steps.download.outputs.download_url }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "ℹ️ Branches auto-deleted after 3 hours by cleanup workflow."
