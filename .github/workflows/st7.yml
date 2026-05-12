@@ -37,6 +37,7 @@ jobs:
       BRANCH_NAME_STREAM: stream-${{ github.run_id }}
       BRANCH_NAME_DOWNLOAD: download-${{ github.run_id }}
     steps:
+      # ---------- setup ----------
       - name: 📂 Checkout Repository
         uses: actions/checkout@v4
         with:
@@ -95,6 +96,7 @@ jobs:
       - name: 📦 Install Python dependencies
         run: pip install -r requirements.txt
 
+      # ---------- convert & gather metadata ----------
       - name: 🎯 Request Conversion & Gather Metadata (retry up to 3 times)
         id: converter
         run: python3 converter.py
@@ -106,6 +108,7 @@ jobs:
           REFERER_URL: ${{ secrets.YT_CONVERT_REFERER }}
           USER_AGENT: ${{ secrets.YT_CONVERT_USER_AGENT }}
 
+      # ---------- sanitize filename ----------
       - name: 🧼 Sanitize filename
         run: |
           FILENAME=$(sed -n '2p' /tmp/metadata.txt)
@@ -113,6 +116,7 @@ jobs:
           echo "🧼 Sanitized: $FILENAME → $SANITIZED"
           sed -i "2s/.*/$SANITIZED/" /tmp/metadata.txt
 
+      # ---------- download & validate original ----------
       - name: 💾 Disk Space Check
         run: |
           AVAIL_KB=$(df /home/runner | awk 'NR==2 {print $4}')
@@ -225,6 +229,7 @@ jobs:
           REFERER_URL: ${{ secrets.YT_CONVERT_REFERER }}
           USER_AGENT: ${{ secrets.YT_CONVERT_USER_AGENT }}
 
+      # ---------- subtitle preprocessing ----------
       - name: 📝 Subtitle Preprocessing
         id: subtitles
         if: ${{ github.event.inputs.type == 'video' }}
@@ -253,6 +258,7 @@ jobs:
             echo "📝 No subtitles available"
           fi
 
+      # ---------- dynamic segment calculation ----------
       - name: 🎚️ Calculate Dynamic Segment Duration
         if: ${{ github.event.inputs.type == 'video' }}
         id: dynamic_hls
@@ -294,6 +300,7 @@ jobs:
           echo "🔄 Final segment duration: ${HLS_TIME}s"
           echo "hls_time=${HLS_TIME}" >> $GITHUB_OUTPUT
 
+      # ---------- HLS processing ----------
       - name: 🎬 Process Video to HLS
         if: ${{ github.event.inputs.type == 'video' }}
         id: process_video
@@ -370,6 +377,7 @@ jobs:
           mkdir -p /tmp/audio
           cp "./downloads/temp/$FILENAME" /tmp/audio/audio.mp3
 
+      # ---------- rewrite URLs ----------
       - name: 🔗 Rewrite Playlist URLs (video)
         if: ${{ github.event.inputs.type == 'video' }}
         run: |
@@ -387,6 +395,7 @@ jobs:
           done
           echo "✅ Playlist rewritten"
 
+      # ---------- player HTML generation ----------
       - name: 🎨 Generate Video Player HTML
         if: ${{ github.event.inputs.type == 'video' }}
         run: |
@@ -404,8 +413,11 @@ jobs:
               PLAYLIST_URL="${BASE_URL}/playlist.m3u8"
           fi
 
+          ORIGINAL_FILENAME=$(sed -n '2p' /tmp/metadata.txt)
+
           sed -e "s|__PLAYLIST_URL__|${PLAYLIST_URL}|g" \
               -e "s|__ZIP_URL__|${ZIP_URL}|g" \
+              -e "s|__VIDEO_TITLE__|${ORIGINAL_FILENAME}|g" \
               player-template.html > /tmp/player.html
 
           python3 -c "
@@ -424,12 +436,15 @@ jobs:
           BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_STREAM}"
           AUDIO_URL="${BASE_URL}/audio.mp3"
           ZIP_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH_NAME_DOWNLOAD}.zip"
+          FILENAME=$(sed -n '2p' /tmp/metadata.txt)
 
           sed -e "s|__AUDIO_URL__|${AUDIO_URL}|g" \
               -e "s|__ZIP_URL__|${ZIP_URL}|g" \
+              -e "s|__AUDIO_TITLE__|${FILENAME}|g" \
               audio-player-template.html > /tmp/audio-player.html
           cp /tmp/audio-player.html ./audio-player.html
 
+      # ---------- split & push download branch ----------
       - name: 📦 Split Original & Push to Download Branch (batched)
         run: |
           set -euo pipefail
@@ -540,6 +555,7 @@ jobs:
           fi
           echo "✅ Download branch '${BRANCH_NAME_DOWNLOAD}' pushed"
 
+      # ---------- push stream branch ----------
       - name: 🚀 Push Stream Branch (video, batched)
         if: ${{ github.event.inputs.type == 'video' }}
         run: |
@@ -632,6 +648,7 @@ jobs:
           fi
           echo "✅ Audio stream branch '${BRANCH_NAME_STREAM}' pushed"
 
+      # ---------- summary ----------
       - name: 📋 Summary
         run: |
           REPO="${{ github.repository }}"
