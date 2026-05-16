@@ -1,4 +1,4 @@
-name: 🎬 YouTube HLS Streamer v4
+name: 🎬 YouTube HLS Streamer v5
 
 on:
   workflow_dispatch:
@@ -386,6 +386,34 @@ jobs:
           mkdir -p /tmp/audio
           cp "./downloads/temp/$FILENAME" /tmp/audio/audio.mp3
 
+      # ---------- ✂️ Split original video into 20 MB playable segments ----------
+      - name: ✂️ Split video into 20 MB playable segments (for Bale delivery)
+        if: ${{ github.event.inputs.type == 'video' }}
+        id: video_segments
+        run: |
+          set -euo pipefail
+          FILENAME=$(sed -n '2p' /tmp/metadata.txt)
+          INPUT_FILE="./downloads/temp/$FILENAME"
+          SEGMENT_DIR="./segment-staging"
+          mkdir -p "$SEGMENT_DIR"
+
+          echo "✂️ Splitting $INPUT_FILE into ≤20 MB segments..."
+          ffmpeg -y -i "$INPUT_FILE" -c copy -f segment -segment_size 19000000 -reset_timestamps 1 "$SEGMENT_DIR/seg_%03d.mp4"
+          echo "✅ Segments created: $(ls -1 "$SEGMENT_DIR")"
+
+          # Build JSON array of segment URLs
+          REPO="${{ github.repository }}"
+          BASE_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_STREAM}"
+          SEGMENTS_JSON="[]"
+          for f in "$SEGMENT_DIR"/seg_*.mp4; do
+            if [ -f "$f" ]; then
+              BASENAME=$(basename "$f")
+              URL="${BASE_URL}/${BASENAME}"
+              SEGMENTS_JSON=$(echo "$SEGMENTS_JSON" | jq --arg url "$URL" '. + [$url]')
+            fi
+          done
+          echo "segments_json=${SEGMENTS_JSON}" >> $GITHUB_OUTPUT
+
       # ---------- rewrite URLs ----------
       - name: 🔗 Rewrite Playlist URLs (video)
         if: ${{ github.event.inputs.type == 'video' }}
@@ -502,8 +530,13 @@ jobs:
 
           # ---- Write metadata for the bot ----
           ZIP_URL="${{ steps.download.outputs.zip_url }}"
-          jq -n --arg download "$DOWNLOAD_URL" --arg zip "$ZIP_URL" --arg playlist "$PLAYLIST_URL" \
-             '{"download_url":$download, "zip_url":$zip, "playlist_url":$playlist}' > metadata.json
+          SEGMENTS_JSON="${{ steps.video_segments.outputs.segments_json }}"
+          jq -n \
+            --arg download "$DOWNLOAD_URL" \
+            --arg zip "$ZIP_URL" \
+            --arg playlist "$PLAYLIST_URL" \
+            --argjson segments "$SEGMENTS_JSON" \
+            '{"download_url":$download, "zip_url":$zip, "playlist_url":$playlist, "segments":$segments}' > metadata.json
 
       - name: 🎨 Generate Audio Player HTML
         if: ${{ github.event.inputs.type == 'audio' }}
@@ -588,7 +621,7 @@ jobs:
             echo "✅ Branch '${BRANCH_NAME}' pushed"
           }
 
-          # Stream staging (HLS + player + metadata)
+          # Stream staging (HLS + player + metadata + video segments)
           STREAM_STAGING=$(mktemp -d)
           if [[ "${{ github.event.inputs.type }}" == 'video' ]]; then
             cp /tmp/hls/*.m4s "$STREAM_STAGING/" 2>/dev/null || true
@@ -596,6 +629,10 @@ jobs:
             cp /tmp/hls/*.m3u8 "$STREAM_STAGING/" 2>/dev/null || true
             cp /tmp/subtitles.vtt "$STREAM_STAGING/" 2>/dev/null || true
             cp /tmp/player.html "$STREAM_STAGING/"
+            # Copy video segments (Bale delivery)
+            if [ -d ./segment-staging ]; then
+              cp ./segment-staging/seg_*.mp4 "$STREAM_STAGING/" 2>/dev/null || true
+            fi
           else
             cp /tmp/audio/audio.mp3 "$STREAM_STAGING/"
             cp /tmp/audio-player.html "$STREAM_STAGING/"
