@@ -454,6 +454,10 @@ jobs:
             echo "📁 File ≤ 90 MB – pushing raw file directly"
             cp "$INPUT_FILE" "$DOWNLOAD_DIR/$FILENAME"
             DOWNLOAD_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/${BRANCH_NAME_DOWNLOAD}/${FILENAME}"
+
+            # Push raw video to zip‑staging so the branch archive ZIP contains only the video file
+            cp "$INPUT_FILE" "$ZIP_DIR/$FILENAME"
+            ZIP_URL="https://github.com/${REPO}/archive/refs/heads/${BRANCH_NAME_ZIP}.zip"
           else
             echo "📁 File > 90 MB – splitting with MP4Box"
             MP4Box -split-size 85M "$INPUT_FILE" -out "$DOWNLOAD_DIR/part"
