@@ -165,40 +165,77 @@ jobs:
           echo "📄 File: $FILENAME"
           echo "🔗 URL (first 120 chars): ${DOWNLOAD_URL:0:120}..."
 
-          download_attempt() {
+          # ----------------------------------------------------------------
+          # download_with_monitor – background curl, 60s stall detection,
+          # plus mid‑download stall detection via --speed-limit.
+          # ----------------------------------------------------------------
+          download_with_monitor() {
             local url="$1" output="$2"
-            echo "   → Attempting download..." >&2
-            HTTP_CODE=$(curl -sS -w "%{http_code}" -L \
+            rm -f "$output"
+
+            echo "   → Starting download (with stall detection)..." >&2
+            curl -sS -L \
               --connect-timeout 30 --max-time 1800 \
               --speed-limit 1024 --speed-time 60 \
               -H "User-Agent: ${USER_AGENT}" \
               -H "Referer: ${REFERER_URL}" \
-              -o "$output" "$url" 2>&1 | tail -1)
-            echo "$HTTP_CODE"
+              -o "$output" "$url" &
+            CURL_PID=$!
+
+            echo "   ... Monitoring for 60 seconds to ensure data is flowing ..." >&2
+            sleep 60
+
+            if kill -0 $CURL_PID 2>/dev/null; then
+              # Process still alive after 60s – check for progress
+              if [[ ! -f "$output" ]] || [[ $(stat -c%s "$output") -eq 0 ]]; then
+                echo "   ⚠️ No data received in 60s. Killing stalled attempt." >&2
+                kill $CURL_PID
+                wait $CURL_PID 2>/dev/null || true
+                return 1
+              else
+                echo "   ✅ Progress detected. Waiting for download to complete..." >&2
+                wait $CURL_PID
+                return $?
+              fi
+            else
+              # Finished within 60s
+              echo "   ... Download finished in under 60s." >&2
+              wait $CURL_PID
+              return $?
+            fi
           }
 
-          HTTP_CODE=""
+          # ----------------------------------------------------------------
+          # Main retry loop (3 attempts)
+          # ----------------------------------------------------------------
+          CURL_EXIT_CODE=1
           for attempt in 1 2 3; do
             echo "📥 Download attempt $attempt/3"
-            HTTP_CODE=$(download_attempt "$DOWNLOAD_URL" "$OUTPUT_FILE")
-            echo "   HTTP status: $HTTP_CODE"
-
-            if [[ "$HTTP_CODE" == "200" ]]; then
+            if download_with_monitor "$DOWNLOAD_URL" "$OUTPUT_FILE"; then
+              CURL_EXIT_CODE=0
+              echo "   ✅ Download completed successfully."
               break
-            fi
-
-            if [[ -f "$OUTPUT_FILE" ]]; then
-              echo "   Response body (first 500 chars):"
-              head -c 500 "$OUTPUT_FILE" || true
-              echo ""
+            else
+              CURL_EXIT_CODE=$?
+              echo "   ❌ Download attempt $attempt failed or stalled."
             fi
 
             if [[ $attempt -lt 3 ]]; then
-              echo "   ⚠️ Non‑200, waiting before retry..."
+              echo "   ⚠️ Waiting before retry..."
               sleep $((5 * attempt))
             fi
           done
 
+          # Map curl exit code back to an HTTP‑style code for later checks
+          if [[ "$CURL_EXIT_CODE" -eq 0 ]]; then
+            HTTP_CODE="200"
+          else
+            HTTP_CODE="000"
+          fi
+
+          # ----------------------------------------------------------------
+          # Token refresh & final verification (unchanged)
+          # ----------------------------------------------------------------
           if [[ "$HTTP_CODE" != "200" ]]; then
             echo "🔄 Attempting token refresh via status URL..."
             FRESH_URL=$(curl -sS -L \
@@ -208,8 +245,11 @@ jobs:
               "$STATUS_URL" | jq -r '.downloadUrl // empty' 2>/dev/null || true)
             if [[ -n "$FRESH_URL" && "$FRESH_URL" != "null" ]]; then
               echo "🔗 Fresh URL obtained, retrying download..."
-              HTTP_CODE=$(download_attempt "$FRESH_URL" "$OUTPUT_FILE")
-              echo "   HTTP status: $HTTP_CODE"
+              if download_with_monitor "$FRESH_URL" "$OUTPUT_FILE"; then
+                HTTP_CODE="200"
+              else
+                echo "   HTTP status: $?"
+              fi
             else
               echo "⚠️ Could not obtain fresh download URL"
             fi
@@ -217,6 +257,11 @@ jobs:
 
           if [[ "$HTTP_CODE" != "200" ]]; then
             echo "❌ Download failed with HTTP $HTTP_CODE"
+            if [[ -f "$OUTPUT_FILE" ]]; then
+              echo "   Response body (first 500 chars):"
+              head -c 500 "$OUTPUT_FILE" || true
+              echo ""
+            fi
             exit 1
           fi
 
