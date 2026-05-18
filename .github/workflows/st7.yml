@@ -705,26 +705,35 @@ jobs:
               return 1
             fi
 
-            # -------------------- combine shards via GitHub API --------------------
+            # -------------------- combine shards via GitHub API (FIXED) --------------------
             echo "🔗 Combining ${NUM_WORKERS} shards into '${BRANCH_NAME}'..."
-            local TREE_JSON="{\"tree\":["
-            local FIRST=true
+
+            # Collect all tree entries from all shards into a single stream
+            ALL_ENTRIES=""
             for i in $(seq 1 $NUM_WORKERS); do
               local SHARD_BRANCH="${BRANCH_NAME}-shard-${i}"
               COMMIT_SHA=$(gh api "repos/${OWNER}/${REPO}/git/ref/heads/${SHARD_BRANCH}" -q '.object.sha' 2>/dev/null) || continue
               TREE_SHA=$(gh api "repos/${OWNER}/${REPO}/git/commits/${COMMIT_SHA}" -q '.tree.sha')
+              # Append the stream of tree objects to our variable
               ENTRIES=$(gh api "repos/${OWNER}/${REPO}/git/trees/${TREE_SHA}?recursive=1" -q '.tree[] | {path, mode, type, sha}')
-              if [ "$FIRST" = true ]; then FIRST=false; else TREE_JSON+=","; fi
-              TREE_JSON+="$ENTRIES"
+              if [[ -n "$ENTRIES" ]]; then
+                ALL_ENTRIES+="$ENTRIES"$'\n'
+              fi
             done
-            TREE_JSON+="]}"
 
-            # Remove newlines (the jq output can be multi-line) – compact to single line
-            TREE_JSON_CLEAN=$(echo "$TREE_JSON" | jq -c '.')
-            NEW_TREE_SHA=$(echo "$TREE_JSON_CLEAN" | gh api "repos/${OWNER}/${REPO}/git/trees" --input - -q '.sha')
-            COMMIT_BODY="{\"message\":\"Combine shards\",\"tree\":\"${NEW_TREE_SHA}\"}"
+            if [ -z "$ALL_ENTRIES" ]; then
+              echo "✅ No entries found in shards to merge. Branch is up-to-date."
+              return 0
+            fi
+
+            # Use jq to "slurp" the stream of JSON objects into a valid JSON array,
+            # then build the final payload for the Git Trees API.
+            TREE_PAYLOAD=$(echo "$ALL_ENTRIES" | jq -s '{"tree": .}')
+
+            NEW_TREE_SHA=$(echo "$TREE_PAYLOAD" | gh api "repos/${OWNER}/${REPO}/git/trees" --input - -q '.sha')
+            COMMIT_BODY="{\"message\":\"chore: Combine ${NUM_WORKERS} shards into stream [skip ci]\",\"tree\":\"${NEW_TREE_SHA}\"}"
             NEW_COMMIT_SHA=$(echo "$COMMIT_BODY" | gh api "repos/${OWNER}/${REPO}/git/commits" --input - -q '.sha')
-            gh api "repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH_NAME}" -X PATCH -f sha="${NEW_COMMIT_SHA}" -f force=true
+            gh api "repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH_NAME}" -X PATCH -f sha="${NEW_COMMIT_SHA}" -f force=true --silent
 
             # Delete shard branches
             echo "🧹 Cleaning up shard branches for '${BRANCH_NAME}'..."
