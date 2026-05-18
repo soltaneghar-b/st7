@@ -165,77 +165,40 @@ jobs:
           echo "📄 File: $FILENAME"
           echo "🔗 URL (first 120 chars): ${DOWNLOAD_URL:0:120}..."
 
-          # ----------------------------------------------------------------
-          # download_with_monitor – background curl, 60s stall detection,
-          # plus mid‑download stall detection via --speed-limit.
-          # ----------------------------------------------------------------
-          download_with_monitor() {
+          download_attempt() {
             local url="$1" output="$2"
-            rm -f "$output"
-
-            echo "   → Starting download (with stall detection)..." >&2
-            curl -sS -L \
+            echo "   → Attempting download..." >&2
+            HTTP_CODE=$(curl -sS -w "%{http_code}" -L \
               --connect-timeout 30 --max-time 1800 \
               --speed-limit 1024 --speed-time 60 \
               -H "User-Agent: ${USER_AGENT}" \
               -H "Referer: ${REFERER_URL}" \
-              -o "$output" "$url" &
-            CURL_PID=$!
-
-            echo "   ... Monitoring for 60 seconds to ensure data is flowing ..." >&2
-            sleep 60
-
-            if kill -0 $CURL_PID 2>/dev/null; then
-              # Process still alive after 60s – check for progress
-              if [[ ! -f "$output" ]] || [[ $(stat -c%s "$output") -eq 0 ]]; then
-                echo "   ⚠️ No data received in 60s. Killing stalled attempt." >&2
-                kill $CURL_PID
-                wait $CURL_PID 2>/dev/null || true
-                return 1
-              else
-                echo "   ✅ Progress detected. Waiting for download to complete..." >&2
-                wait $CURL_PID
-                return $?
-              fi
-            else
-              # Finished within 60s
-              echo "   ... Download finished in under 60s." >&2
-              wait $CURL_PID
-              return $?
-            fi
+              -o "$output" "$url" 2>&1 | tail -1)
+            echo "$HTTP_CODE"
           }
 
-          # ----------------------------------------------------------------
-          # Main retry loop (3 attempts)
-          # ----------------------------------------------------------------
-          CURL_EXIT_CODE=1
+          HTTP_CODE=""
           for attempt in 1 2 3; do
             echo "📥 Download attempt $attempt/3"
-            if download_with_monitor "$DOWNLOAD_URL" "$OUTPUT_FILE"; then
-              CURL_EXIT_CODE=0
-              echo "   ✅ Download completed successfully."
+            HTTP_CODE=$(download_attempt "$DOWNLOAD_URL" "$OUTPUT_FILE")
+            echo "   HTTP status: $HTTP_CODE"
+
+            if [[ "$HTTP_CODE" == "200" ]]; then
               break
-            else
-              CURL_EXIT_CODE=$?
-              echo "   ❌ Download attempt $attempt failed or stalled."
+            fi
+
+            if [[ -f "$OUTPUT_FILE" ]]; then
+              echo "   Response body (first 500 chars):"
+              head -c 500 "$OUTPUT_FILE" || true
+              echo ""
             fi
 
             if [[ $attempt -lt 3 ]]; then
-              echo "   ⚠️ Waiting before retry..."
+              echo "   ⚠️ Non‑200, waiting before retry..."
               sleep $((5 * attempt))
             fi
           done
 
-          # Map curl exit code back to an HTTP‑style code for later checks
-          if [[ "$CURL_EXIT_CODE" -eq 0 ]]; then
-            HTTP_CODE="200"
-          else
-            HTTP_CODE="000"
-          fi
-
-          # ----------------------------------------------------------------
-          # Token refresh & final verification (unchanged)
-          # ----------------------------------------------------------------
           if [[ "$HTTP_CODE" != "200" ]]; then
             echo "🔄 Attempting token refresh via status URL..."
             FRESH_URL=$(curl -sS -L \
@@ -245,11 +208,8 @@ jobs:
               "$STATUS_URL" | jq -r '.downloadUrl // empty' 2>/dev/null || true)
             if [[ -n "$FRESH_URL" && "$FRESH_URL" != "null" ]]; then
               echo "🔗 Fresh URL obtained, retrying download..."
-              if download_with_monitor "$FRESH_URL" "$OUTPUT_FILE"; then
-                HTTP_CODE="200"
-              else
-                echo "   HTTP status: $?"
-              fi
+              HTTP_CODE=$(download_attempt "$FRESH_URL" "$OUTPUT_FILE")
+              echo "   HTTP status: $HTTP_CODE"
             else
               echo "⚠️ Could not obtain fresh download URL"
             fi
@@ -257,11 +217,6 @@ jobs:
 
           if [[ "$HTTP_CODE" != "200" ]]; then
             echo "❌ Download failed with HTTP $HTTP_CODE"
-            if [[ -f "$OUTPUT_FILE" ]]; then
-              echo "   Response body (first 500 chars):"
-              head -c 500 "$OUTPUT_FILE" || true
-              echo ""
-            fi
             exit 1
           fi
 
@@ -626,13 +581,11 @@ jobs:
       # ---------- push all three branches in parallel ----------
       - name: 🚀 Push All Branches (parallel)
         if: ${{ steps.download.outputs.download_url != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
-          # -------------------- batched push (download & zip) --------------------
+          # Helper function: batched push to a branch
           batched_push() {
             local STAGING_DIR="$1"
             local BRANCH_NAME="$2"
@@ -688,108 +641,7 @@ jobs:
             echo "✅ Branch '${BRANCH_NAME}' pushed"
           }
 
-          # -------------------- parallel shard push (stream branch) --------------------
-          parallel_shards_push() {
-            local STAGING_DIR="$1"
-            local BRANCH_NAME="$2"
-            local NUM_WORKERS="$3"
-            local OWNER="$4"
-            local REPO="$5"
-
-            if [ -z "$(ls -A "$STAGING_DIR" 2>/dev/null)" ]; then
-              echo "ℹ️  No files to push for branch '${BRANCH_NAME}'"
-              return 0
-            fi
-
-            mapfile -t ALL_FILES < <(find "$STAGING_DIR" -type f)
-            local TOTAL=${#ALL_FILES[@]}
-            local CHUNK_SIZE=$(( (TOTAL + NUM_WORKERS - 1) / NUM_WORKERS ))
-            local PIDS=()
-
-            echo "🌀 Starting parallel shard push for '${BRANCH_NAME}' with ${NUM_WORKERS} workers"
-
-            for i in $(seq 1 $NUM_WORKERS); do
-              local START=$(( (i - 1) * CHUNK_SIZE ))
-              local WORKER_FILES=("${ALL_FILES[@]:$START:$CHUNK_SIZE}")
-              if [ ${#WORKER_FILES[@]} -eq 0 ]; then continue; fi
-
-              local SHARD_BRANCH="${BRANCH_NAME}-shard-${i}"
-              (
-                set -euo pipefail
-                WORK_DIR=$(mktemp -d)
-                cd "$WORK_DIR"
-                git init
-                git config user.name "github-actions[bot]"
-                git config user.email "github-actions[bot]@users.noreply.github.com"
-                git remote add origin "$REPO_URL"
-                for f in "${WORKER_FILES[@]}"; do
-                  REL=$(realpath --relative-to="$STAGING_DIR" "$f")
-                  mkdir -p "$(dirname "$REL")"
-                  cp "$f" "$REL"
-                done
-                git add .
-                git commit -m "shard ${i}" || { echo "ℹ️ Worker ${i}: nothing to commit"; exit 0; }
-                for attempt in 1 2 3 4; do
-                  if git push origin "HEAD:${SHARD_BRANCH}" --force; then
-                    echo "✅ Worker ${i}: pushed to ${SHARD_BRANCH}"
-                    exit 0
-                  fi
-                  sleep $((2 ** (attempt-1)))
-                done
-                echo "❌ Worker ${i}: push failed"
-                exit 1
-              ) &
-              PIDS+=($!)
-            done
-
-            # Wait for all workers
-            local FAILED=0
-            for pid in "${PIDS[@]}"; do wait "$pid" || FAILED=1; done
-            if [ $FAILED -eq 1 ]; then
-              echo "❌ One or more shard pushes failed for '${BRANCH_NAME}'"
-              return 1
-            fi
-
-            # -------------------- combine shards via GitHub API (FIXED) --------------------
-            echo "🔗 Combining ${NUM_WORKERS} shards into '${BRANCH_NAME}'..."
-
-            # Collect all tree entries from all shards into a single stream
-            ALL_ENTRIES=""
-            for i in $(seq 1 $NUM_WORKERS); do
-              local SHARD_BRANCH="${BRANCH_NAME}-shard-${i}"
-              COMMIT_SHA=$(gh api "repos/${OWNER}/${REPO}/git/ref/heads/${SHARD_BRANCH}" -q '.object.sha' 2>/dev/null) || continue
-              TREE_SHA=$(gh api "repos/${OWNER}/${REPO}/git/commits/${COMMIT_SHA}" -q '.tree.sha')
-              # Append the stream of tree objects to our variable
-              ENTRIES=$(gh api "repos/${OWNER}/${REPO}/git/trees/${TREE_SHA}?recursive=1" -q '.tree[] | {path, mode, type, sha}')
-              if [[ -n "$ENTRIES" ]]; then
-                ALL_ENTRIES+="$ENTRIES"$'\n'
-              fi
-            done
-
-            if [ -z "$ALL_ENTRIES" ]; then
-              echo "✅ No entries found in shards to merge. Branch is up-to-date."
-              return 0
-            fi
-
-            # Use jq to "slurp" the stream of JSON objects into a valid JSON array,
-            # then build the final payload for the Git Trees API.
-            TREE_PAYLOAD=$(echo "$ALL_ENTRIES" | jq -s '{"tree": .}')
-
-            NEW_TREE_SHA=$(echo "$TREE_PAYLOAD" | gh api "repos/${OWNER}/${REPO}/git/trees" --input - -q '.sha')
-            COMMIT_BODY="{\"message\":\"chore: Combine ${NUM_WORKERS} shards into stream [skip ci]\",\"tree\":\"${NEW_TREE_SHA}\"}"
-            NEW_COMMIT_SHA=$(echo "$COMMIT_BODY" | gh api "repos/${OWNER}/${REPO}/git/commits" --input - -q '.sha')
-            gh api "repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH_NAME}" -X PATCH -f sha="${NEW_COMMIT_SHA}" -f force=true --silent
-
-            # Delete shard branches
-            echo "🧹 Cleaning up shard branches for '${BRANCH_NAME}'..."
-            for i in $(seq 1 $NUM_WORKERS); do
-              gh api -X DELETE "repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH_NAME}-shard-${i}" 2>/dev/null || true
-            done
-
-            echo "✅✅ Branch '${BRANCH_NAME}' pushed and shards merged"
-          }
-
-          # -------------------- staging --------------------
+          # Stream staging (HLS + player + metadata + video segments)
           STREAM_STAGING=$(mktemp -d)
           if [[ "${{ github.event.inputs.type }}" == 'video' ]]; then
             cp /tmp/hls/*.m4s "$STREAM_STAGING/" 2>/dev/null || true
@@ -797,6 +649,7 @@ jobs:
             cp /tmp/hls/*.m3u8 "$STREAM_STAGING/" 2>/dev/null || true
             cp /tmp/subtitles.vtt "$STREAM_STAGING/" 2>/dev/null || true
             cp /tmp/player.html "$STREAM_STAGING/"
+            # Copy video segments (Bale delivery)
             if [ -d ./segment-staging ]; then
               cp ./segment-staging/seg_*.mp4 "$STREAM_STAGING/" 2>/dev/null || true
             fi
@@ -806,17 +659,17 @@ jobs:
           fi
           cp metadata.json "$STREAM_STAGING/"
 
-          # -------------------- launch pushes --------------------
+          # Launch all three pushes in parallel
           batched_push "./download-staging" "$BRANCH_NAME_DOWNLOAD" 25 &
           PID_DL=$!
 
           batched_push "./zip-staging" "$BRANCH_NAME_ZIP" 25 &
           PID_ZIP=$!
 
-          parallel_shards_push "$STREAM_STAGING" "$BRANCH_NAME_STREAM" 4 \
-            "${{ github.repository_owner }}" "${{ github.event.repository.name }}" &
+          batched_push "$STREAM_STAGING" "$BRANCH_NAME_STREAM" 50 &
           PID_STREAM=$!
 
+          # Wait for all
           FAILED=0
           wait $PID_DL || { echo "❌ Download branch push failed"; FAILED=1; }
           wait $PID_ZIP || { echo "❌ ZIP branch push failed"; FAILED=1; }
