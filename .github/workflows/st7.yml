@@ -585,7 +585,7 @@ jobs:
           set -euo pipefail
           REPO_URL="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
-          # Helper function: batched push to a branch
+          # -------------------- batched push (download & zip) --------------------
           batched_push() {
             local STAGING_DIR="$1"
             local BRANCH_NAME="$2"
@@ -641,7 +641,99 @@ jobs:
             echo "✅ Branch '${BRANCH_NAME}' pushed"
           }
 
-          # Stream staging (HLS + player + metadata + video segments)
+          # -------------------- parallel shard push (stream branch) --------------------
+          parallel_shards_push() {
+            local STAGING_DIR="$1"
+            local BRANCH_NAME="$2"
+            local NUM_WORKERS="$3"
+            local OWNER="$4"
+            local REPO="$5"
+
+            if [ -z "$(ls -A "$STAGING_DIR" 2>/dev/null)" ]; then
+              echo "ℹ️  No files to push for branch '${BRANCH_NAME}'"
+              return 0
+            fi
+
+            mapfile -t ALL_FILES < <(find "$STAGING_DIR" -type f)
+            local TOTAL=${#ALL_FILES[@]}
+            local CHUNK_SIZE=$(( (TOTAL + NUM_WORKERS - 1) / NUM_WORKERS ))
+            local PIDS=()
+
+            echo "🌀 Starting parallel shard push for '${BRANCH_NAME}' with ${NUM_WORKERS} workers"
+
+            for i in $(seq 1 $NUM_WORKERS); do
+              local START=$(( (i - 1) * CHUNK_SIZE ))
+              local WORKER_FILES=("${ALL_FILES[@]:$START:$CHUNK_SIZE}")
+              if [ ${#WORKER_FILES[@]} -eq 0 ]; then continue; fi
+
+              local SHARD_BRANCH="${BRANCH_NAME}-shard-${i}"
+              (
+                set -euo pipefail
+                WORK_DIR=$(mktemp -d)
+                cd "$WORK_DIR"
+                git init
+                git config user.name "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                git remote add origin "$REPO_URL"
+                for f in "${WORKER_FILES[@]}"; do
+                  REL=$(realpath --relative-to="$STAGING_DIR" "$f")
+                  mkdir -p "$(dirname "$REL")"
+                  cp "$f" "$REL"
+                done
+                git add .
+                git commit -m "shard ${i}" || { echo "ℹ️ Worker ${i}: nothing to commit"; exit 0; }
+                for attempt in 1 2 3 4; do
+                  if git push origin "HEAD:${SHARD_BRANCH}" --force; then
+                    echo "✅ Worker ${i}: pushed to ${SHARD_BRANCH}"
+                    exit 0
+                  fi
+                  sleep $((2 ** (attempt-1)))
+                done
+                echo "❌ Worker ${i}: push failed"
+                exit 1
+              ) &
+              PIDS+=($!)
+            done
+
+            # Wait for all workers
+            local FAILED=0
+            for pid in "${PIDS[@]}"; do wait "$pid" || FAILED=1; done
+            if [ $FAILED -eq 1 ]; then
+              echo "❌ One or more shard pushes failed for '${BRANCH_NAME}'"
+              return 1
+            fi
+
+            # -------------------- combine shards via GitHub API --------------------
+            echo "🔗 Combining ${NUM_WORKERS} shards into '${BRANCH_NAME}'..."
+            local TREE_JSON="{\"tree\":["
+            local FIRST=true
+            for i in $(seq 1 $NUM_WORKERS); do
+              local SHARD_BRANCH="${BRANCH_NAME}-shard-${i}"
+              COMMIT_SHA=$(gh api "repos/${OWNER}/${REPO}/git/ref/heads/${SHARD_BRANCH}" -q '.object.sha' 2>/dev/null) || continue
+              TREE_SHA=$(gh api "repos/${OWNER}/${REPO}/git/commits/${COMMIT_SHA}" -q '.tree.sha')
+              ENTRIES=$(gh api "repos/${OWNER}/${REPO}/git/trees/${TREE_SHA}?recursive=1" -q '.tree[] | {path, mode, type, sha}')
+              if [ "$FIRST" = true ]; then FIRST=false; else TREE_JSON+=","; fi
+              TREE_JSON+="$ENTRIES"
+            done
+            TREE_JSON+="]}"
+
+            # Remove newlines (the jq output can be multi-line) – compact to single line
+            TREE_JSON_CLEAN=$(echo "$TREE_JSON" | jq -c '.')
+            NEW_TREE_SHA=$(echo "$TREE_JSON_CLEAN" | gh api "repos/${OWNER}/${REPO}/git/trees" --input - -q '.sha')
+            COMMIT_BODY="{\"message\":\"Combine shards\",\"tree\":\"${NEW_TREE_SHA}\"}"
+            NEW_COMMIT_SHA=$(echo "$COMMIT_BODY" | gh api "repos/${OWNER}/${REPO}/git/commits" --input - -q '.sha')
+            gh api "repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH_NAME}" -X PATCH -f sha="${NEW_COMMIT_SHA}" -f force=true
+
+            # Delete shard branches
+            echo "🧹 Cleaning up shard branches for '${BRANCH_NAME}'..."
+            for i in $(seq 1 $NUM_WORKERS); do
+              gh api -X DELETE "repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH_NAME}-shard-${i}" 2>/dev/null || true
+            done
+
+            echo "✅✅ Branch '${BRANCH_NAME}' pushed and shards merged"
+          }
+
+          # -------------------- staging --------------------
           STREAM_STAGING=$(mktemp -d)
           if [[ "${{ github.event.inputs.type }}" == 'video' ]]; then
             cp /tmp/hls/*.m4s "$STREAM_STAGING/" 2>/dev/null || true
@@ -649,7 +741,6 @@ jobs:
             cp /tmp/hls/*.m3u8 "$STREAM_STAGING/" 2>/dev/null || true
             cp /tmp/subtitles.vtt "$STREAM_STAGING/" 2>/dev/null || true
             cp /tmp/player.html "$STREAM_STAGING/"
-            # Copy video segments (Bale delivery)
             if [ -d ./segment-staging ]; then
               cp ./segment-staging/seg_*.mp4 "$STREAM_STAGING/" 2>/dev/null || true
             fi
@@ -659,17 +750,17 @@ jobs:
           fi
           cp metadata.json "$STREAM_STAGING/"
 
-          # Launch all three pushes in parallel
+          # -------------------- launch pushes --------------------
           batched_push "./download-staging" "$BRANCH_NAME_DOWNLOAD" 25 &
           PID_DL=$!
 
           batched_push "./zip-staging" "$BRANCH_NAME_ZIP" 25 &
           PID_ZIP=$!
 
-          batched_push "$STREAM_STAGING" "$BRANCH_NAME_STREAM" 50 &
+          parallel_shards_push "$STREAM_STAGING" "$BRANCH_NAME_STREAM" 4 \
+            "${{ github.repository_owner }}" "${{ github.event.repository.name }}" &
           PID_STREAM=$!
 
-          # Wait for all
           FAILED=0
           wait $PID_DL || { echo "❌ Download branch push failed"; FAILED=1; }
           wait $PID_ZIP || { echo "❌ ZIP branch push failed"; FAILED=1; }
